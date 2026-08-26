@@ -244,6 +244,19 @@ test("geminiPcmLayout prefers explicit fields, then the mime rate param, then 24
   assert.deepEqual(geminiPcmLayout({ mime_type: "audio/l16" }), { sampleRate: 24000, channels: 1 });
 });
 
+// Observed live from gemini-3.1-flash-tts-preview on 2026-08-26: spaces after
+// the `;` separators, and the layout repeated in both the mime params and the
+// explicit fields. Locks the parsing to the real wire format.
+test("gemini's real l16 mime string is treated as headerless PCM at 24 kHz mono", () => {
+  const live = { mime_type: "audio/l16; rate=24000; channels=1", sample_rate: 24000, channels: 1 };
+  assert.equal(isContainerAudio(live, Buffer.from([0, 0, 1, 0, 2, 0])), false);
+  assert.deepEqual(geminiPcmLayout(live), { sampleRate: 24000, channels: 1 });
+  assert.deepEqual(geminiPcmLayout({ mime_type: "audio/l16; rate=24000; channels=1" }), {
+    sampleRate: 24000,
+    channels: 1,
+  });
+});
+
 test("isContainerAudio recognises container mime types and RIFF/ID3 magic, not bare PCM", () => {
   const pcm = Buffer.from([0, 1, 2, 3, 4, 5]);
   assert.equal(isContainerAudio({ mime_type: "audio/wav" }, pcm), true);
