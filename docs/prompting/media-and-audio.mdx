@@ -19,8 +19,9 @@ exactly what the words say.
 ## Voiceover (TTS)
 
 The agent picks a voice engine in a fixed order. HeyGen Starfish goes first if
-your HeyGen account is configured. ElevenLabs is next if that key is set.
-Otherwise the local Kokoro model runs, and it needs no API key.
+your HeyGen account is configured. ElevenLabs is next if that key is set, then
+Gemini if a `GEMINI_API_KEY` is present. Otherwise the local Kokoro model runs,
+and it needs no API key.
 
 Describe the content and let the agent pick a fitting voice. Or name the voice,
 tone, and speed yourself:

@@ -14,7 +14,7 @@ node skills/media-use/audio/scripts/heygen-tts.mjs \
 
 `narration.words.json` is already in the `[{ id, text, start, end }]` shape the captions pipeline consumes — no separate transcribe pass.
 
-## Path B — ElevenLabs / Kokoro (TTS → Whisper)
+## Path B — ElevenLabs / Gemini / Kokoro (TTS → Whisper)
 
 These providers don't return word data. Generate the audio, then transcribe:
 

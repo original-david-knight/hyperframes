@@ -1,36 +1,45 @@
 import { describe, expect, it } from "vitest";
 import { decideMusic, decideVoice, KOKORO_PIP, MUSICGEN_PIP } from "./providers.js";
 
-describe("decideVoice — mirrors the skill's heygen → elevenlabs → kokoro order", () => {
+describe("decideVoice — mirrors the skill's heygen → elevenlabs → gemini → kokoro order", () => {
+  const none = { hasHeygen: false, elevenlabs: false, gemini: false, kokoro: true };
+
   it("prefers HeyGen when configured", () => {
-    const r = decideVoice({ hasHeygen: true, elevenlabs: true, kokoro: true });
+    const r = decideVoice({ hasHeygen: true, elevenlabs: true, gemini: true, kokoro: true });
     expect(r.engine).toBe("heygen");
     expect(r.ready).toBe(true);
   });
 
   it("falls to ElevenLabs only when key + module are both present", () => {
-    expect(decideVoice({ hasHeygen: false, elevenlabs: true, kokoro: true }).engine).toBe(
-      "elevenlabs",
-    );
+    expect(decideVoice({ ...none, elevenlabs: true }).engine).toBe("elevenlabs");
+  });
+
+  it("keeps ElevenLabs ahead of Gemini when both keys are set", () => {
+    expect(decideVoice({ ...none, elevenlabs: true, gemini: true }).engine).toBe("elevenlabs");
+  });
+
+  it("falls to Gemini when its key is the only cloud credential", () => {
+    const r = decideVoice({ ...none, gemini: true });
+    expect(r.engine).toBe("gemini");
+    expect(r.label).toBe("Gemini TTS");
+    expect(r.local).toBe(false);
+    expect(r.ready).toBe(true);
+    expect(r.setupHint).toBeUndefined();
   });
 
   it("falls to Kokoro when no cloud provider is usable", () => {
-    expect(decideVoice({ hasHeygen: false, elevenlabs: false, kokoro: true }).engine).toBe(
-      "kokoro",
-    );
+    expect(decideVoice(none).engine).toBe("kokoro");
   });
 
   it("flags Kokoro as not-ready with a pip hint when deps are missing", () => {
-    const r = decideVoice({ hasHeygen: false, elevenlabs: false, kokoro: false });
+    const r = decideVoice({ ...none, kokoro: false });
     expect(r.engine).toBe("kokoro");
     expect(r.ready).toBe(false);
     expect(r.setupHint).toBe(KOKORO_PIP);
   });
 
   it("omits the hint when Kokoro is ready", () => {
-    expect(
-      decideVoice({ hasHeygen: false, elevenlabs: false, kokoro: true }).setupHint,
-    ).toBeUndefined();
+    expect(decideVoice(none).setupHint).toBeUndefined();
   });
 });
 

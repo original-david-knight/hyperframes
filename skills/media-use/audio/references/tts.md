@@ -36,11 +36,12 @@ Use another voice only for a documented reason, and write the reason down.
 
 ## Available routes
 
-| Order | Provider          | Env trigger                                 | Voice IDs                                   | Word timestamps                           | Audio format         |
-| ----- | ----------------- | ------------------------------------------- | ------------------------------------------- | ----------------------------------------- | -------------------- |
-| 1     | HeyGen (Starfish) | `$HEYGEN_API_KEY` / `~/.heygen/credentials` | UUIDs from `GET /v3/voices?engine=starfish` | **Yes** (`word_timestamps[]` in response) | mp3 → wav via ffmpeg |
-| 2     | ElevenLabs        | `$ELEVENLABS_API_KEY`                       | UUIDs from elevenlabs.io dashboard          | No                                        | mp3 → wav via ffmpeg |
-| 3     | Kokoro-82M        | always (local fallback)                     | `am_michael`, `af_heart`, … (54 voices)     | No                                        | wav direct           |
+| Order | Provider          | Env trigger                                 | Voice IDs                                   | Word timestamps                           | Audio format             |
+| ----- | ----------------- | ------------------------------------------- | ------------------------------------------- | ----------------------------------------- | ------------------------ |
+| 1     | HeyGen (Starfish) | `$HEYGEN_API_KEY` / `~/.heygen/credentials` | UUIDs from `GET /v3/voices?engine=starfish` | **Yes** (`word_timestamps[]` in response) | mp3 → wav via ffmpeg     |
+| 2     | ElevenLabs        | `$ELEVENLABS_API_KEY`                       | UUIDs from elevenlabs.io dashboard          | No                                        | mp3 → wav via ffmpeg     |
+| 3     | Gemini TTS        | `$GEMINI_API_KEY` / `$GOOGLE_API_KEY`       | `Kore`, `Puck`, `Charon`, … (30 prebuilt)   | No                                        | raw PCM → wav via ffmpeg |
+| 4     | Kokoro-82M        | always (local fallback)                     | `am_michael`, `af_heart`, … (54 voices)     | No                                        | wav direct               |
 
 ```bash
 # Local Kokoro CLI
@@ -81,18 +82,41 @@ node skills/media-use/audio/scripts/heygen-tts.mjs --list   # public starfish vo
 - **Words:** `--words <path>` writes the flat `[{id,text,start,end}]` shape below, drop-in for the captions pipeline. HeyGen's `<start>`/`<end>` boundary sentinels are filtered out and ids are re-contiguous.
 - **Non-English:** `--lang <code>` (anything but `en`) is sent as the request `language`.
 
+## Gemini TTS (no CLI, no Python) — `$GEMINI_API_KEY`
+
+Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY` — the same aliases Lyria BGM reads) and
+the audio engine picks Gemini when no HeyGen credential or ElevenLabs key is
+present; force it with `--provider gemini`. The engine calls the Interactions
+API directly, so there is nothing to install beyond `ffmpeg`. One key already
+set for Lyria or capture descriptions is enough.
+
+- **Model:** `gemini-3.1-flash-tts-preview` by default; `GEMINI_TTS_MODEL` overrides it (e.g. `gemini-2.5-pro-preview-tts`).
+- **Voice:** `--voice <name>` is one of the 30 prebuilt voices — `Kore`, `Puck`, `Charon`, `Zephyr`, `Fenrir`, `Leda`, `Orus`, `Aoede`, `Enceladus`, `Sulafat`, … Default **Kore** (firm, neutral). The full list is in the [speech generation guide](https://ai.google.dev/gemini-api/docs/speech-generation).
+- **Delivery:** Gemini has no speed or emotion parameters — steer it in the text itself (`Say warmly, at an easy pace: …`). The engine's `speed` is not applied. Language is auto-detected from the text.
+- **Output:** headerless 24 kHz 16-bit mono PCM, wrapped to 44.1k mono wav via ffmpeg. No word timestamps — the engine runs Whisper afterwards (`transcribeWav`), exactly as it does for ElevenLabs and Kokoro.
+
+```bash
+curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/interactions" \
+  -H "x-goog-api-key: $GEMINI_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"gemini-3.1-flash-tts-preview","input":"Say warmly: welcome to HyperFrames.",
+       "response_format":{"type":"audio"},"generation_config":{"speech_config":[{"voice":"Kore"}]}}'
+```
+
+The audio comes back base64-encoded inside the last `model_output` step.
+
 ## When to use which provider
 
 | Goal                                                      | Use                                                 |
 | --------------------------------------------------------- | --------------------------------------------------- |
 | Best voice quality + word timestamps in one call          | **HeyGen**                                          |
 | Drop-in cloud TTS, big voice catalog                      | **ElevenLabs**                                      |
+| Cloud TTS on a key you already hold for Lyria / capture   | **Gemini**                                          |
 | Offline, no API key, fast iteration                       | **Kokoro**                                          |
 | Non-English multilingual with deterministic phonemization | **Kokoro** (`ef_dora`, `jf_alpha`, `zf_xiaobei`, …) |
 
 ## ffmpeg requirement
 
-HeyGen + ElevenLabs return mp3. The bundled HeyGen helper transcodes to wav
+HeyGen + ElevenLabs return mp3; Gemini returns headerless PCM. The bundled HeyGen helper transcodes to wav
 when `--output` ends in `.wav` (the default and what downstream `ffprobe` +
 Whisper expect). If you'd rather skip the transcode, pass `-o file.mp3`.
 Without `ffmpeg` on PATH, wav output from cloud providers fails; the local
@@ -162,4 +186,4 @@ When `--words <path>` is passed to a HeyGen call, the file is written in the sam
 ]
 ```
 
-For ElevenLabs / Kokoro, run `npx hyperframes transcribe narration.wav --model small.en` to get the same shape.
+For ElevenLabs / Gemini / Kokoro, run `npx hyperframes transcribe narration.wav --model small.en` to get the same shape.

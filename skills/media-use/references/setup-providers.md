@@ -41,6 +41,11 @@ upsell. Cost rule (X4): the agent confirms before an agent-initiated paid call;
 a user-requested one just runs — `heygen.video` is flagged paid (metered free
 allowance) so an agent-initiated `resolve --type video` confirms first.
 
+Workflow narration (the shared audio engine, `audio/scripts/audio.mjs`) also
+accepts a Gemini key for voice: `$GEMINI_API_KEY` / `$GOOGLE_API_KEY` selects
+Gemini TTS after HeyGen and ElevenLabs and ahead of local Kokoro — REST only,
+nothing to install. See `audio/references/tts.md`.
+
 To force a specific generator (e.g. a user says "make this image with codex"),
 pass `--provider codex`: it pins resolution to that provider and skips the
 free-usage default. See `references/operations.md` for the RAM ladders and

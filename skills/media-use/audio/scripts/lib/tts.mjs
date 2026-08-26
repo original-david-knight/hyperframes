@@ -7,7 +7,13 @@
 //        in the same call, so no separate transcribe pass.
 //   2. ElevenLabs         — $ELEVENLABS_API_KEY + `pip install elevenlabs`. No
 //        word timings → caller chains transcribeWav().
-//   3. Kokoro-82M (local) — always available, via the published `hyperframes tts`
+//   3. Gemini TTS         — $GEMINI_API_KEY / $GOOGLE_API_KEY (the same aliases
+//        Lyria BGM reads). Direct REST against the Interactions API, no Python.
+//        Returns headerless 24 kHz PCM → wrapped to wav via ffmpeg. No word
+//        timings → caller chains transcribeWav(). Sits AFTER ElevenLabs so a
+//        dedicated TTS key keeps winning; a key set only for Lyria still beats
+//        the local model.
+//   4. Kokoro-82M (local) — always available, via the published `hyperframes tts`
 //        CLI. No word timings → caller chains transcribeWav().
 //
 // "HeyGen available" is decided by CREDENTIAL presence (heygenCredential), never
@@ -33,20 +39,42 @@ export function elevenlabsAvailable() {
   return r.status === 0;
 }
 
+// Gemini and Lyria share one key: whichever alias is set serves both.
+export function geminiApiKey(env = process.env) {
+  return env.GEMINI_API_KEY || env.GOOGLE_API_KEY || null;
+}
+export function geminiAvailable() {
+  return geminiApiKey() !== null;
+}
+
+export const PROVIDERS = ["heygen", "elevenlabs", "gemini", "kokoro"];
+const GEMINI_KEY_HINT = "provider=gemini but neither $GEMINI_API_KEY nor $GOOGLE_API_KEY is set";
+
 // First available provider wins; an explicit choice is honored (and validated).
-export function pickProvider(userProvider) {
+// `deps` is injectable for tests — the ElevenLabs probe spawns Python and the
+// HeyGen one reads ~/.heygen, neither of which a unit test should depend on.
+export function pickProvider(userProvider, deps = {}) {
+  const available = {
+    heygen: deps.heygenAvailable ?? heygenAvailable,
+    elevenlabs: deps.elevenlabsAvailable ?? elevenlabsAvailable,
+    gemini: deps.geminiAvailable ?? geminiAvailable,
+  };
   if (userProvider) {
-    if (!["heygen", "elevenlabs", "kokoro"].includes(userProvider))
-      throw new Error(`invalid provider "${userProvider}" (heygen | elevenlabs | kokoro)`);
-    if (userProvider === "heygen" && !heygenAvailable())
+    if (!PROVIDERS.includes(userProvider))
+      throw new Error(`invalid provider "${userProvider}" (${PROVIDERS.join(" | ")})`);
+    if (userProvider === "heygen" && !available.heygen())
       throw new Error(
         "provider=heygen but no HeyGen credentials (set $HEYGEN_API_KEY or run `npx hyperframes auth login`)",
       );
     if (userProvider === "elevenlabs" && !process.env.ELEVENLABS_API_KEY)
       throw new Error("provider=elevenlabs but $ELEVENLABS_API_KEY is not set");
+    if (userProvider === "gemini" && !available.gemini()) throw new Error(GEMINI_KEY_HINT);
     return userProvider;
   }
-  return heygenAvailable() ? "heygen" : elevenlabsAvailable() ? "elevenlabs" : "kokoro";
+  if (available.heygen()) return "heygen";
+  if (available.elevenlabs()) return "elevenlabs";
+  if (available.gemini()) return "gemini";
+  return "kokoro";
 }
 
 // ── voice resolution ──────────────────────────────────────────────────────────
@@ -56,6 +84,7 @@ export function pickProvider(userProvider) {
 export async function resolveVoiceId({ provider, userVoice, lang = "en" }) {
   if (userVoice) return userVoice;
   if (provider === "elevenlabs") return "21m00Tcm4TlvDq8ikWAM"; // Rachel
+  if (provider === "gemini") return "Kore"; // prebuilt voice — firm, neutral, good narrator
   if (provider === "kokoro") {
     if (lang === "en") return "am_michael";
     throw new Error("Kokoro non-English needs an explicit --voice (see references/tts.md)");
@@ -236,11 +265,191 @@ audio = client.text_to_speech.convert(
 save(audio, sys.argv[3])
 `;
 
+// ── Gemini TTS ────────────────────────────────────────────────────────────────
+// Single-speaker speech through the Interactions API:
+// https://ai.google.dev/gemini-api/docs/speech-generation
+export const GEMINI_TTS_DEFAULT_MODEL = "gemini-3.1-flash-tts-preview";
+export function geminiTtsModel(env = process.env) {
+  return env.GEMINI_TTS_MODEL || GEMINI_TTS_DEFAULT_MODEL;
+}
+const GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
+
+// Container formats ffmpeg detects on its own. Anything else (audio/l16,
+// audio/pcm, or no mime type at all) is headerless PCM and needs its layout
+// spelled out — see geminiPcmLayout.
+const CONTAINER_MIME = new Set([
+  "audio/wav",
+  "audio/x-wav",
+  "audio/mp3",
+  "audio/mpeg",
+  "audio/ogg",
+  "audio/ogg_opus",
+  "audio/opus",
+  "audio/flac",
+  "audio/aac",
+  "audio/m4a",
+  "audio/aiff",
+]);
+const CONTAINER_MAGIC = ["RIFF", "ID3", "OggS", "fLaC", "FORM"];
+
+function audioMime(item) {
+  return String(item?.mime_type ?? item?.mimeType ?? "").toLowerCase();
+}
+
+// Pull the audio block out of an Interactions response. The API answers with
+// `steps[]` (older responses: `outputs[]`); the generated audio is the last
+// `type:"audio"` item of the last `model_output` step. SDK-shaped payloads
+// carry it pre-extracted as `output_audio`. Pure — unit-tested.
+export function findGeminiAudio(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  if (payload.output_audio?.type === "audio") return payload.output_audio;
+  const steps = Array.isArray(payload.steps)
+    ? payload.steps
+    : Array.isArray(payload.outputs)
+      ? payload.outputs
+      : [];
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i];
+    if (step?.type !== "model_output" || !Array.isArray(step.content)) continue;
+    for (let j = step.content.length - 1; j >= 0; j--) {
+      if (step.content[j]?.type === "audio") return step.content[j];
+    }
+  }
+  return null;
+}
+
+// Headerless PCM layout: explicit fields first, then a `rate=` mime parameter,
+// then the documented 24 kHz mono default.
+export function geminiPcmLayout(item) {
+  const rateParam = /rate=(\d+)/.exec(audioMime(item));
+  return {
+    sampleRate:
+      Number(item?.sample_rate ?? item?.sampleRate) || (rateParam ? Number(rateParam[1]) : 24000),
+    channels: Number(item?.channels) || 1,
+  };
+}
+
+export function isContainerAudio(item, bytes) {
+  if (CONTAINER_MIME.has(audioMime(item).split(";")[0].trim())) return true;
+  const head = Buffer.from(bytes.subarray(0, 4)).toString("latin1");
+  return CONTAINER_MAGIC.some((magic) => head.startsWith(magic));
+}
+
+// raw s16le bytes → wav 44.1k mono at destWav (same target as transcodeToWav).
+function pcmToWav(bytes, sampleRate, channels, destWav) {
+  const td = mkdtempSync(join(tmpdir(), "hf-tts-"));
+  const tmp = join(td, "a.pcm");
+  writeFileSync(tmp, bytes);
+  mkdirSync(dirname(destWav), { recursive: true });
+  const ff = spawnSync(
+    "ffmpeg",
+    [
+      "-y",
+      "-loglevel",
+      "error",
+      "-f",
+      "s16le",
+      "-ar",
+      String(sampleRate),
+      "-ac",
+      String(channels),
+      "-i",
+      tmp,
+      "-ar",
+      "44100",
+      "-ac",
+      "1",
+      destWav,
+    ],
+    { stdio: "ignore" },
+  );
+  rmSync(td, { recursive: true, force: true });
+  return ff.status === 0 && existsSync(destWav);
+}
+
+// Google wraps failures as { error: { message } }; keep that message, else the
+// trimmed raw body so a non-JSON 5xx still says something.
+async function geminiErrorDetail(res) {
+  try {
+    const raw = typeof res.text === "function" ? await res.text() : "";
+    if (!raw) return "";
+    try {
+      const msg = JSON.parse(raw)?.error?.message;
+      if (msg) return `: ${msg}`;
+    } catch {}
+    return `: ${raw.slice(0, 200).trim()}`;
+  } catch {
+    return "";
+  }
+}
+
+// `deps` is injectable for tests; production uses the real fetch/ffmpeg impls.
+// Never throws; every failure path names WHY in `error`. Gemini has no numeric
+// speed control and auto-detects the language, so `speed`/`lang` are not sent —
+// delivery is steered in the text itself ("Say warmly: …").
+export async function synthesizeGemini({ text, voiceId, wavAbs }, deps = {}) {
+  const fetchImpl = deps.fetch ?? fetch;
+  const wrapPcm = deps.pcmToWav ?? pcmToWav;
+  const transcode = deps.transcodeToWav ?? transcodeToWav;
+  const apiKey = (deps.apiKey ?? geminiApiKey)();
+  const model = deps.model ?? geminiTtsModel();
+  if (!apiKey) return { ok: false, words: null, error: GEMINI_KEY_HINT };
+  try {
+    const body = {
+      model,
+      input: text,
+      response_format: { type: "audio" },
+      generation_config: { speech_config: [{ voice: voiceId }] },
+    };
+    const res = await fetchImpl(GEMINI_INTERACTIONS_URL, {
+      method: "POST",
+      headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const detail = await geminiErrorDetail(res);
+      return { ok: false, words: null, error: `Gemini interactions HTTP ${res.status}${detail}` };
+    }
+    const item = findGeminiAudio(await res.json());
+    if (!item)
+      return { ok: false, words: null, error: `Gemini (${model}) returned no audio content` };
+    let bytes;
+    if (typeof item.data === "string" && item.data) {
+      bytes = Buffer.from(item.data, "base64");
+    } else if (typeof item.uri === "string" && item.uri) {
+      const audio = await fetchImpl(item.uri);
+      if (!audio.ok) {
+        return {
+          ok: false,
+          words: null,
+          error: `Gemini audio uri fetch failed: HTTP ${audio.status}`,
+        };
+      }
+      bytes = Buffer.from(await audio.arrayBuffer());
+    } else {
+      return { ok: false, words: null, error: "Gemini audio content had neither data nor uri" };
+    }
+    if (!bytes.length) return { ok: false, words: null, error: "Gemini returned empty audio" };
+    let written;
+    if (isContainerAudio(item, bytes)) {
+      written = transcode(bytes, wavAbs);
+    } else {
+      const { sampleRate, channels } = geminiPcmLayout(item);
+      written = wrapPcm(bytes, sampleRate, channels, wavAbs);
+    }
+    if (!written) return { ok: false, words: null, error: "wav transcode failed (ffmpeg)" };
+    return { ok: true, words: null };
+  } catch (e) {
+    return { ok: false, words: null, error: e?.message ? String(e.message) : String(e) };
+  }
+}
+
 // ── synthesize one line ───────────────────────────────────────────────────────
 // Writes wav at wavAbs. Returns { ok, words, error } — words is the raw
-// [{text,start,end}] array for HeyGen (native), or null for ElevenLabs/Kokoro
-// (caller must transcribeWav). Never throws; failures return { ok:false, error }
-// where `error` states WHY (so the caller can surface it, not a bare "TTS failed").
+// [{text,start,end}] array for HeyGen (native), or null for ElevenLabs/Gemini/
+// Kokoro (caller must transcribeWav). Never throws; failures return { ok:false,
+// error } where `error` states WHY (so the caller can surface it, not a bare
+// "TTS failed").
 export async function synthesizeOne({
   provider,
   text,
@@ -274,6 +483,7 @@ export async function synthesizeOne({
     const r = await spawnP(cmd, args, {});
     return synthResult(r, wavAbs, "elevenlabs (python)");
   }
+  if (provider === "gemini") return synthesizeGemini({ text, voiceId, wavAbs });
   // kokoro — via the published CLI; --output is relative to the project dir.
   const wavRel = relTo(hyperframesDir, wavAbs);
   const args = ["hyperframes", "tts", writeTmpText(text), "--voice", voiceId, "--output", wavRel];
@@ -343,7 +553,7 @@ export async function synthesizeHeygen({ text, voiceId, lang, speed, wavAbs }, d
   }
 }
 
-// ElevenLabs/Kokoro have no word timings — run Whisper over the wav. Returns the
+// ElevenLabs/Gemini/Kokoro have no word timings — run Whisper over the wav. Returns the
 // flat [{id,text,start,end}] word array, or null. Each call uses a throwaway
 // --dir so parallel scenes don't collide on transcript.json.
 export async function transcribeWav({ wavRel, lang = "en", hyperframesDir }) {
